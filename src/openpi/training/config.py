@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.ur5_policy as ur5_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -352,6 +353,55 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUR5DataConfig(DataConfigFactory):
+    """Data config for the ur5_gamepad dataset (6-dim absolute joint actions, global+wrist cameras)."""
+
+    action_sequence_keys: Sequence[str] = ("action",)
+    # If True, the dataset has a 7th gripper dimension in state/action (ur5_gripper_dataset).
+    with_gripper: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Remap dataset keys to the intermediate keys consumed by UR5Inputs.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "base_rgb": "observation.images.global",
+                        "wrist_rgb": "observation.images.wrist",
+                        "joints": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        action_dim = 7 if self.with_gripper else 6
+        data_transforms = _transforms.Group(
+            inputs=[ur5_policy.UR5Inputs(model_type=model_config.model_type)],
+            outputs=[ur5_policy.UR5Outputs(action_dim=action_dim)],
+        )
+
+        # Dataset actions are absolute; train in delta space. Gripper dim (-1) stays absolute.
+        delta_action_mask = _transforms.make_bool_mask(6, -1) if self.with_gripper else _transforms.make_bool_mask(6)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask), ur5_policy.ClampActions(limit=6.0)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -739,6 +789,75 @@ _CONFIGS = [
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
+    ),
+    #
+    # UR5 fine-tuning configs (A1astor/ur5_gamepad: 6-DoF absolute joints, global+wrist cameras).
+    #
+    TrainConfig(
+        name="pi05_ur5",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotUR5DataConfig(
+            repo_id="ur5_gamepad_v21",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        # Official pi05_libero anti-divergence hyperparams: gradient clipping + cosine schedule.
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        num_train_steps=4_000,
+    ),
+    TrainConfig(
+        name="pi05_ur5_gripper",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=15,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotUR5DataConfig(
+            repo_id="ur5_gripper_v21",
+            with_gripper=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        # NOTE: continuation from the old pi05_ur5 step-4000 LoRA is impossible — every
+        # mid-training checkpoint saved before the async-save race fix has NaN in all
+        # float32 trainable arrays. Start fresh from pi05_base (proven stable path).
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=20_000,
     ),
     TrainConfig(
         name="pi05_libero",

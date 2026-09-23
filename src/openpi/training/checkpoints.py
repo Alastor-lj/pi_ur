@@ -78,6 +78,17 @@ def save_state(
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
         train_state, params = _split_params(state)
+    # Snapshot device arrays to host BEFORE handing off to the async save thread.
+    # The training loop keeps updating float32 trainable params in-place; serializing
+    # live device buffers concurrently produced torn/NaN checkpoints (frozen bf16
+    # params were unaffected, which is why only trainable arrays were corrupted).
+    import numpy as _np
+
+    def _to_host(x):
+        return _np.asarray(x) if isinstance(x, jax.Array) else x
+
+    train_state = jax.tree.map(_to_host, train_state)
+    params = jax.tree.map(_to_host, params)
     items = {
         "assets": save_assets,
         "train_state": train_state,
