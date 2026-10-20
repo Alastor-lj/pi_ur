@@ -390,11 +390,15 @@ class LeRobotUR5DataConfig(DataConfigFactory):
         # Dataset actions are absolute; train in delta space. Gripper dim (-1) stays absolute.
         delta_action_mask = _transforms.make_bool_mask(6, -1) if self.with_gripper else _transforms.make_bool_mask(6)
         data_transforms = data_transforms.push(
-            inputs=[_transforms.DeltaActions(delta_action_mask), ur5_policy.ClampActions(limit=6.0)],
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
         )
 
         model_transforms = ModelTransformFactory()(model_config)
+        # Clamp in NORMALIZED space (model_transforms run after Normalize): kills episode-boundary
+        # amplification on small-range dims that a raw-unit clamp cannot see. No-op at inference
+        # (no "actions" key in observations).
+        model_transforms = model_transforms.push(inputs=[ur5_policy.ClampActions(limit=3.0)])
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -858,6 +862,40 @@ _CONFIGS = [
             decay_lr=2.5e-6,
         ),
         num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_ur5_15hz",
+        # DROID real-robot template alignment (pi05_droid_finetune):
+        #   action_horizon=16 @ 15Hz -> 1.07s window (covers the 0.83s gripper release stroke);
+        #   discrete_state_input left at pi05 default True (state enters as discrete language tokens).
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotUR5DataConfig(
+            repo_id="ur5_openpi_15hz_v21",
+            with_gripper=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=15_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=15_000,
     ),
     TrainConfig(
         name="pi05_libero",
